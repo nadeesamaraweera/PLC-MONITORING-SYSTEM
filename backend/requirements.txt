@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+pydantic
+pyserial
+pymodbus>=3.6
+openpyxl
