@@ -23,21 +23,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from serial.tools import list_ports
-from pymodbus.client import ModbusSerialClient
+from pymodbus.client import ModbusSerialClient, ModbusTcpClient
 from openpyxl import Workbook
 from openpyxl.styles import Font
 
 app = FastAPI(title="PLC Dashboard API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# ---- Network PLC (Modbus TCP) -----------------------------------------------
+# Delixi CDC5 over the LAN port. Change the IP / port here if the PLC changes.
+TCP_PLC_IP = "192.168.1.200"
+TCP_PLC_PORT = 2000
+TCP_PORT_ID = f"TCP:{TCP_PLC_IP}:{TCP_PLC_PORT}"
+
 # ---- Models shown in the dropdown -------------------------------------------
 # d_base / y_base are added to the register numbers below to get the real
 # Modbus address.
 #   Delta DVP : D0 = 0x1000 (4096), Y0 = 0x0500 (1280)
-#   Delixi    : NOT VERIFIED. Open the Modbus address table in your Delixi
-#               manual, find the Modbus address of D0 and Y0, and put them in.
+#   Delixi CDC5: D0 = 40000 (verified: D100 -> address 40100).
+#               y_base is NOT verified yet (output coils).
 MODELS = [
-    {"id": "delixi-cdc5", "name": "Delixi CDC5 series", "baud": 9600, "parity": "N", "d_base": 0, "y_base": 0},
+    {"id": "delixi-cdc5", "name": "Delixi CDC5 series", "baud": 9600, "parity": "N", "d_base": 40000, "y_base": 0},
     {"id": "delixi-cdi-e", "name": "Delixi CDI-E series", "baud": 9600, "parity": "N", "d_base": 0, "y_base": 0},
     {"id": "delixi-cdi-s", "name": "Delixi CDI-S series", "baud": 9600, "parity": "N", "d_base": 0, "y_base": 0},
     {"id": "delta-dvp", "name": "Delta DVP series", "baud": 9600, "parity": "E", "d_base": 0x1000, "y_base": 0x0500},
@@ -59,7 +65,7 @@ _conn = {"slave": 1, "y_base": 0, "demo": False}  # settings of the current conn
 
 class ConnectRequest(BaseModel):
     model: str
-    port: str            # e.g. "COM3", "/dev/ttyUSB0" or "DEMO"
+    port: str            # e.g. "COM3", "/dev/ttyUSB0", "TCP:192.168.1.200:2000" or "DEMO"
     baud: int = 9600
     parity: str = "N"    # N / E / O
     slave: int = 1
@@ -84,18 +90,22 @@ def poll_loop(slave, client, stop, demo, d_base, y_base):
                     state["d"][k] = max(0, state["d"][k] + random.randint(-2, 2)) or 50
             else:
                 with _io_lock:
+                    # make sure the link is up (TCP can drop; this reconnects)
+                    if not client.connected:
+                        client.connect()
                     for name, reg in D_MAP.items():
                         r = _call(client.read_holding_registers, d_base + reg, count=1, slave=slave)
                         if r.isError():
                             raise IOError(f"{name}: {r}")
                         state["d"][name] = r.registers[0]
-                    # Y000..Y003 are contiguous -> one request for all coils
+                    # Y000..Y003 are contiguous -> one request for all coils.
+                    # If the coil address is not right yet, skip it instead of
+                    # stopping the whole dashboard.
                     first = y_base + Y_MAP[y_names[0]]
                     r = _call(client.read_coils, first, count=len(y_names), slave=slave)
-                    if r.isError():
-                        raise IOError(f"Y coils: {r}")
-                    for i, name in enumerate(y_names):
-                        state["y"][name] = bool(r.bits[i])
+                    if not r.isError():
+                        for i, name in enumerate(y_names):
+                            state["y"][name] = bool(r.bits[i])
             state["error"] = None
             state["updated"] = time.strftime("%H:%M:%S")
         except Exception as e:  # keep running, show the error on the dashboard
@@ -111,6 +121,7 @@ def models():
 @app.get("/api/ports")
 def ports():
     found = [{"port": p.device, "label": f"{p.device} - {p.description}"} for p in list_ports.comports()]
+    found.append({"port": TCP_PORT_ID, "label": f"Network - Delixi PLC ({TCP_PLC_IP}:{TCP_PLC_PORT})"})
     found.append({"port": "DEMO", "label": "DEMO (test without a PLC)"})
     return found
 
@@ -126,10 +137,23 @@ def connect(req: ConnectRequest):
     demo = req.port == "DEMO"
     client = None
     if not demo:
-        client = ModbusSerialClient(port=req.port, baudrate=req.baud, parity=req.parity,
-                                    stopbits=1, bytesize=8, timeout=1)
-        if not client.connect():
-            raise HTTPException(400, f"Cannot open {req.port}. Is another program (such as the PLC software) using it?")
+        if req.port.startswith("TCP:"):
+            try:
+                _, host, tcp_port = req.port.split(":")
+                client = ModbusTcpClient(host, port=int(tcp_port), timeout=2)
+            except ValueError:
+                raise HTTPException(400, f"Bad network port '{req.port}'. Use TCP:IP:PORT, e.g. {TCP_PORT_ID}")
+            if not client.connect():
+                raise HTTPException(
+                    400,
+                    f"Cannot reach {host}:{tcp_port}. Check: ping {host}, Wi-Fi off, "
+                    "cable plugged in, and no other program (test scripts, PLC software) holding the PLC connection.",
+                )
+        else:
+            client = ModbusSerialClient(port=req.port, baudrate=req.baud, parity=req.parity,
+                                        stopbits=1, bytesize=8, timeout=1)
+            if not client.connect():
+                raise HTTPException(400, f"Cannot open {req.port}. Is another program (such as the PLC software) using it?")
     else:
         state["y"] = {k: random.random() > 0.5 for k in Y_MAP}   # demo starting point
     _client = client
